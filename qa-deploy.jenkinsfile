@@ -1,0 +1,69 @@
+podTemplate(yaml: """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins-agent: daemonless
+spec:
+  containers:
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:v1.6.0-debug
+      command:
+        - cat
+      tty: true
+    - name: gcloud
+      image: google/cloud-sdk:352.0.0
+      command:
+        - cat
+      tty: true
+"""
+) {
+  node(POD_LABEL) {
+    def appVersion = "none"
+
+    try {
+       stage("Checkout") {
+            ws("klarnact-demo-app") {
+                checkout changelog: false, poll: false, scm: [$class: 'GitSCM', branches: [[name: "main"]], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: 'klarnact-demo-app-github-ssh-key', url: 'ssh://git@github.com/e2x/klarnact-demo-app']]]
+            }
+       }
+
+      stage("Build") {
+        container("kaniko") {
+            withCredentials([
+                file(credentialsId: 'klarnact-gcp-service-account', variable: 'GOOGLE_APPLICATION_CREDENTIALS'),
+                file(credentialsId: 'klarnact-demo-app-secrets-qa', variable: 'DOT_ENV')
+                ]) {
+                ws("klarnact-demo-app") {
+                    writeFile file: '.env', text: readFile(DOT_ENV)
+                    def packageProps = readJSON file: "package.json"
+                    appVersion = packageProps['version']
+                    sh "/kaniko/executor -f Dockerfile -c \$(pwd) --single-snapshot --destination=eu.gcr.io/klarnact/klarna-demo-app:${appVersion}-SNAPSHOT"
+                }
+            }
+        }
+      }
+
+      stage("Deploy") {
+        container("gcloud") {
+            withCredentials([file(credentialsId: 'klarnact-gcp-service-account', variable: 'GC_KEY')]) {
+                ws("klarnact-demo-app") {
+                    sh 'gcloud auth activate-service-account --key-file=${GC_KEY}'
+                    sh """gcloud beta run deploy demo-app \
+                        --region europe-west1 \
+                        --image eu.gcr.io/klarnact/klarna-demo-app:${appVersion}-SNAPSHOT \
+                        --platform managed \
+                        --allow-unauthenticated \
+                        --project klarnact \
+                    """
+                }
+            }
+        }
+      }
+    }
+    catch(e) {
+      currentBuild.result = "FAILURE"
+      throw e
+    }
+  }
+}
